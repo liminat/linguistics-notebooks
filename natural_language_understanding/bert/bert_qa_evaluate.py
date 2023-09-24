@@ -206,4 +206,185 @@ def predict(features,
                 prelim_predictions.append(
                     _PrelimPrediction(
                         feature_index=features_id,
-   
+                        start_index=start_index,
+                        end_index=end_index,
+                        pred_start=result.start[start_index],
+                        pred_end=result.end[end_index]))
+
+    if version_2:
+        prelim_predictions.append(
+            _PrelimPrediction(
+                feature_index=min_null_feature_index,
+                start_index=0,
+                end_index=0,
+                pred_start=null_pred_start,
+                pred_end=null_pred_end))
+
+    prelim_predictions = sorted(
+        prelim_predictions,
+        key=lambda x: (x.pred_start + x.pred_end),
+        reverse=True)
+
+    seen_predictions = {}
+    nbest = []
+    for pred in prelim_predictions:
+        if len(nbest) >= n_best_size:
+            break
+        feature = features[pred.feature_index]
+        if pred.start_index > 0:  # this is a non-null prediction
+            tok_tokens = feature.tokens[pred.start_index:(
+                pred.end_index + 1)]
+            orig_doc_start = feature.token_to_orig_map[pred.start_index]
+            orig_doc_end = feature.token_to_orig_map[pred.end_index]
+            orig_tokens = feature.doc_tokens[orig_doc_start:(
+                orig_doc_end + 1)]
+            tok_text = ' '.join(tok_tokens)
+
+            # De-tokenize WordPieces that have been split off.
+            tok_text = tok_text.replace(' ##', '')
+            tok_text = tok_text.replace('##', '')
+
+            # Clean whitespace
+            tok_text = tok_text.strip()
+            tok_text = ' '.join(tok_text.split())
+            orig_text = ' '.join(orig_tokens)
+
+            final_text = get_final_text(tok_text, orig_text, tokenizer)
+            if final_text in seen_predictions:
+                continue
+
+            seen_predictions[final_text] = True
+        else:
+            final_text = ''
+            seen_predictions[final_text] = True
+
+        nbest.append(
+            _NbestPrediction(
+                text=final_text,
+                pred_start=pred.pred_start,
+                pred_end=pred.pred_end))
+
+    # if we didn't inlude the empty option in the n-best, inlcude it
+    if version_2:
+        if '' not in seen_predictions:
+            nbest.append(
+                _NbestPrediction(
+                    text='',
+                    pred_start=null_pred_start,
+                    pred_end=null_pred_end))
+    # In very rare edge cases we could have no valid predictions. So we
+    # just create a nonce prediction in this case to avoid failure.
+    if not nbest:
+        nbest.append(
+            _NbestPrediction(text='empty', pred_start=0.0, pred_end=0.0))
+
+    assert len(nbest) >= 1
+
+    total_scores = []
+    best_non_null_entry = None
+    for entry in nbest:
+        total_scores.append(entry.pred_start + entry.pred_end)
+        if not best_non_null_entry:
+            if entry.text:
+                best_non_null_entry = entry
+
+    probs = nd.softmax(nd.array(total_scores)).asnumpy()
+
+    nbest_json = []
+
+    for (i, entry) in enumerate(nbest):
+        nbest_json.append((entry.text, float(probs[i])))
+
+    if not version_2:
+        prediction = nbest_json[0][0]
+    else:
+        # predict '' iff the null score - the score of best non-null > threshold
+        score_diff = score_null - best_non_null_entry.pred_start - \
+            best_non_null_entry.pred_end
+
+        if score_diff > null_score_diff_threshold:
+            prediction = ''
+        else:
+            prediction = best_non_null_entry.text
+
+    prediction = nbest_json[0][0]
+    return prediction, nbest_json
+
+
+def normalize_answer(s):
+    """Lower text and remove punctuation, articles and extra whitespace."""
+
+    def remove_articles(text):
+        return re.sub(r'\b(a|an|the)\b', ' ', text)
+
+    def white_space_fix(text):
+        return ' '.join(text.split())
+
+    def remove_punc(text):
+        exclude = set(string.punctuation)
+        return ''.join(ch for ch in text if ch not in exclude)
+
+    def lower(text):
+        return text.lower()
+
+    return white_space_fix(remove_articles(remove_punc(lower(s))))
+
+
+def f1_score(prediction, ground_truth):
+    """Calculate the F1 scores.
+    """
+    prediction_tokens = normalize_answer(prediction).split()
+    ground_truth_tokens = normalize_answer(ground_truth).split()
+    common = Counter(prediction_tokens) & Counter(ground_truth_tokens)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0
+    precision = 1.0 * num_same / len(prediction_tokens)
+    recall = 1.0 * num_same / len(ground_truth_tokens)
+    f1 = (2 * precision * recall) / (precision + recall)
+    return f1
+
+
+def exact_match_score(prediction, ground_truth):
+    """Calculate the EM scores.
+    """
+    return (normalize_answer(prediction) == normalize_answer(ground_truth))
+
+
+def metric_max_over_ground_truths(metric_fn, prediction, ground_truths):
+    scores_for_ground_truths = []
+    for ground_truth in ground_truths:
+        score = metric_fn(prediction, ground_truth)
+        scores_for_ground_truths.append(score)
+    return max(scores_for_ground_truths)
+
+
+def get_F1_EM(dataset, predict_data):
+    """Calculate the F1 and EM scores of the predicted results.
+    Use only with the SQuAD1.1 dataset.
+
+    Parameters
+    ----------
+    dataset_file: string
+        Path to the data file.
+    predict_data: dict
+        All final predictions.
+
+    Returns
+    -------
+    scores: dict
+        F1 and EM scores.
+    """
+    f1 = exact_match = total = 0
+    for record in dataset:
+        total += 1
+        if record[1] not in predict_data:
+            message = 'Unanswered question ' + record[1] + \
+                ' will receive score 0.'
+            print(message)
+            continue
+        ground_truths = record[4]
+        prediction = predict_data[record[1]]
+        exact_match += metric_max_over_ground_truths(
+            exact_match_score, prediction, ground_truths)
+        f1 += metric_max_over_ground_truths(f1_score, pred
