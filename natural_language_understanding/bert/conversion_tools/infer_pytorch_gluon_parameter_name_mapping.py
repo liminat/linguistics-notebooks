@@ -60,4 +60,35 @@ parameters = {k: v.data().asnumpy() for k, v in parameters.items()}
 # Load PyTorch Model
 pytorch_parameters = torch.load(os.path.join(args.pytorch_checkpoint_dir, 'pytorch_model.bin'),
                                 map_location=lambda storage, loc: storage)
-pytorch_vocab = tf_vocab_to_glu
+pytorch_vocab = tf_vocab_to_gluon_vocab(
+    load_text_vocab(os.path.join(args.pytorch_checkpoint_dir, 'vocab.txt')))
+pytorch_parameters = {k: v.numpy() for k, v in pytorch_parameters.items()}
+
+# Assert that vocabularies are equal
+assert pytorch_vocab.idx_to_token == vocab.idx_to_token
+
+mapping = dict()
+
+for name, param in parameters.items():
+    found_match = False
+    for pytorch_name, pytorch_param in pytorch_parameters.items():
+        if param.shape == pytorch_param.shape:
+            if (param == pytorch_param).all():
+                if found_match:
+                    print('Found multiple matches for {}. '
+                          'Ignoring new match {}'.format(name, pytorch_name))
+                else:
+                    found_match = True
+                    mapping.update({name: pytorch_name})
+
+        # We don't break here, in case there are mulitple matches
+
+    if not found_match:
+        raise RuntimeError('Pytorch and Gluon model do not match. '
+                           'Cannot infer mapping of names.')
+
+assert len(mapping) == len(parameters)
+
+with open(args.out, 'w') as f:
+    json.dump(mapping, f, indent="  ")
+    print('Wrote mapping to {}'.format(args.out))
