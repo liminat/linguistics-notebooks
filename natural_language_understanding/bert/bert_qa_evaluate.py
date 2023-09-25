@@ -387,4 +387,11 @@ def get_F1_EM(dataset, predict_data):
         prediction = predict_data[record[1]]
         exact_match += metric_max_over_ground_truths(
             exact_match_score, prediction, ground_truths)
-        f1 += metric_max_over_ground_truths(f1_score, pred
+        f1 += metric_max_over_ground_truths(f1_score, prediction,
+                                            ground_truths)
+    exact_match = 100.0 * exact_match / total
+    f1 = 100.0 * f1 / total
+
+    scores = {'exact_match': exact_match, 'f1': f1}
+
+    return scores
