@@ -178,4 +178,65 @@ def save_model(new_gluon_parameters, output_dir):
     encoder = BERTEncoder(attention_cell=predefined_args['attention_cell'],
                           num_layers=predefined_args['num_layers'], units=predefined_args['units'],
                           hidden_size=predefined_args['hidden_size'],
-                          m
+                          max_length=predefined_args['max_length'],
+                          num_heads=predefined_args['num_heads'], scaled=predefined_args['scaled'],
+                          dropout=predefined_args['dropout'],
+                          use_residual=predefined_args['use_residual'],
+                          activation='relu')
+
+    bert = BERTModel(encoder, len(vocab),
+                     token_type_vocab_size=predefined_args['token_type_vocab_size'],
+                     units=predefined_args['units'], embed_size=predefined_args['embed_size'],
+                     embed_dropout=predefined_args['embed_dropout'],
+                     word_embed=predefined_args['word_embed'], use_pooler=True,
+                     use_decoder=False, use_classifier=False)
+
+    bert.initialize(init=mx.init.Normal(0.02))
+
+    ones = mx.nd.ones((2, 8))
+    out = bert(ones, ones, mx.nd.array([5, 6]), mx.nd.array([[1], [2]]))
+    params = bert._collect_params_with_prefix()
+    assert len(params) == len(new_gluon_parameters), "Gluon model does not match paddle model. " \
+                                                   "Please fix the BERTModel hyperparameters"
+
+    # post processings for parameters:
+    # - handle tied decoder weight
+    new_gluon_parameters['decoder.3.weight'] = new_gluon_parameters['word_embed.0.weight']
+    # set parameter data
+    loaded_params = {}
+    for name in params:
+        if name == 'word_embed.0.weight':
+            arr = mx.nd.array(new_gluon_parameters[name][:params[name].shape[0]])
+        else:
+            arr = mx.nd.array(new_gluon_parameters[name])
+        try:
+            assert arr.shape == params[name].shape
+        except:
+            print(name)
+        params[name].set_data(arr)
+        loaded_params[name] = True
+
+    # post processings for parameters:
+    # - handle tied decoder weight
+    # - update word embedding for reserved tokens
+
+    if len(params) != len(loaded_params):
+        raise RuntimeError('The Gluon BERTModel comprises {} parameter arrays, '
+                           'but {} have been extracted from the paddle model. '.format(
+            len(params), len(loaded_params)))
+
+    # param serialization
+    bert.save_parameters(tmp_file_path)
+    hash_full, hash_short = get_hash(tmp_file_path)
+    gluon_param_path = os.path.expanduser(os.path.join(args.out_dir, hash_short + '.params'))
+    logging.info('param saved to %s. hash = %s', gluon_param_path, hash_full)
+    bert.save_parameters(gluon_param_path)
+    mx.nd.waitall()
+    # save config
+    print('finish save vocab')
+    print('save model done!'.center(60, '='))
+
+
+if __name__ == "__main__":
+    state_dict = extract_weights(args)
+    save_model(state_dict, args.out_dir)
