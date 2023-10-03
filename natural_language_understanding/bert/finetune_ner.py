@@ -189,4 +189,42 @@ def main(config):
                                                   np_true_tags, np_pred_tags, np_valid_length)
 
         all_true_tags = [[entry.true_tag for entry in entries] for entries in predictions]
-      
+        all_pred_tags = [[entry.pred_tag for entry in entries] for entries in predictions]
+        seqeval_f1 = seqeval.metrics.f1_score(all_true_tags, all_pred_tags)
+        return seqeval_f1
+
+    best_dev_f1 = 0.0
+    last_test_f1 = 0.0
+    best_epoch = -1
+
+    last_epoch_step_num = 0
+    for epoch_index in range(config.num_epochs):
+        last_epoch_step_num = train(train_data_loader, last_epoch_step_num)
+        train_f1 = evaluate(train_data_loader)
+        logging.info('train f1: %3f', train_f1)
+        dev_f1 = evaluate(dev_data_loader)
+        logging.info('dev f1: %3f, previous best dev f1: %3f', dev_f1, best_dev_f1)
+        if dev_f1 > best_dev_f1:
+            best_dev_f1 = dev_f1
+            best_epoch = epoch_index
+            logging.info('update the best dev f1 to be: %3f', best_dev_f1)
+            test_f1 = evaluate(test_data_loader)
+            logging.info('test f1: %3f', test_f1)
+            last_test_f1 = test_f1
+
+            # save params
+            params_file = config.save_checkpoint_prefix + '_{:03d}.params'.format(epoch_index)
+            logging.info('saving current checkpoint to: %s', params_file)
+            net.save_parameters(params_file)
+
+        logging.info('current best epoch: %d', best_epoch)
+
+    logging.info('best epoch: %d, best dev f1: %3f, test f1 at tha epoch: %3f',
+                 best_epoch, best_dev_f1, last_test_f1)
+
+
+if __name__ == '__main__':
+    logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s',
+                        level=logging.DEBUG, datefmt='%Y-%m-%d %I:%M:%S')
+    logging.getLogger().setLevel(logging.INFO)
+    main(parse_args())
