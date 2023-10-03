@@ -222,4 +222,21 @@ if __name__ == '__main__':
         context = mx.cpu()
     bert_embedding = BertEmbedding(ctx=context, model=args.model, dataset_name=args.dataset_name,
                                    max_seq_length=args.max_seq_length, batch_size=args.batch_size)
-    
+    result = []
+    sents = []
+    if args.sentences:
+        sents = args.sentences
+        result = bert_embedding(sents, oov_way=args.oov_way)
+    elif args.file:
+        with io.open(args.file, 'r', encoding='utf8') as in_file:
+            for line in in_file:
+                sents.append(line.strip())
+        result = bert_embedding(sents, oov_way=args.oov_way)
+    else:
+        logger.error('Please specify --sentence or --file')
+
+    if result:
+        for sent, embeddings in zip(sents, result):
+            print('Text: {}'.format(sent))
+            _, tokens_embedding = embeddings
+            print('Tokens embedding: {}'.format(tokens_embedding))
