@@ -121,4 +121,160 @@ parser.add_argument('--test_batch_size',
 parser.add_argument('--optimizer',
                     type=str,
                     default='bertadam',
-                    help='optimization algorithm. defau
+                    help='optimization algorithm. default is bertadam(mxnet >= 1.5.0.)')
+
+parser.add_argument('--accumulate',
+                    type=int,
+                    default=None,
+                    help='The number of batches for '
+                    'gradients accumulation to simulate large batch size. Default is None')
+
+parser.add_argument('--lr',
+                    type=float,
+                    default=5e-5,
+                    help='Initial learning rate. default is 5e-5')
+
+parser.add_argument('--warmup_ratio',
+                    type=float,
+                    default=0.1,
+                    help='ratio of warmup steps that linearly increase learning rate from '
+                    '0 to target learning rate. default is 0.1')
+
+parser.add_argument('--log_interval',
+                    type=int,
+                    default=50,
+                    help='report interval. default is 50')
+
+parser.add_argument('--max_seq_length',
+                    type=int,
+                    default=384,
+                    help='The maximum total input sequence length after WordPiece tokenization.'
+                    'Sequences longer than this will be truncated, and sequences shorter '
+                    'than this will be padded. default is 384')
+
+parser.add_argument('--doc_stride',
+                    type=int,
+                    default=128,
+                    help='When splitting up a long document into chunks, how much stride to '
+                    'take between chunks. default is 128')
+
+parser.add_argument('--max_query_length',
+                    type=int,
+                    default=64,
+                    help='The maximum number of tokens for the question. Questions longer than '
+                    'this will be truncated to this length. default is 64')
+
+parser.add_argument('--n_best_size',
+                    type=int,
+                    default=20,
+                    help='The total number of n-best predictions to generate in the '
+                    'nbest_predictions.json output file. default is 20')
+
+parser.add_argument('--max_answer_length',
+                    type=int,
+                    default=30,
+                    help='The maximum length of an answer that can be generated. This is needed '
+                    'because the start and end predictions are not conditioned on one another.'
+                    ' default is 30')
+
+parser.add_argument('--version_2',
+                    action='store_true',
+                    help='SQuAD examples whether contain some that do not have an answer.')
+
+parser.add_argument('--null_score_diff_threshold',
+                    type=float,
+                    default=0.0,
+                    help='If null_score - best_non_null is greater than the threshold predict null.'
+                    'Typical values are between -1.0 and -5.0. default is 0.0')
+
+parser.add_argument('--gpu',
+                    type=int,
+                    default=None,
+                    help='which gpu to use for finetuning. CPU is used if not set.')
+
+parser.add_argument('--sentencepiece',
+                    type=str,
+                    default=None,
+                    help='Path to the sentencepiece .model file for both tokenization and vocab.')
+
+parser.add_argument('--debug',
+                    action='store_true',
+                    help='Run the example in test mode for sanity checks')
+
+args = parser.parse_args()
+
+output_dir = args.output_dir
+if not os.path.exists(output_dir):
+    os.mkdir(output_dir)
+
+fh = logging.FileHandler(os.path.join(
+    args.output_dir, 'finetune_squad.log'), mode='w')
+fh.setLevel(logging.INFO)
+fh.setFormatter(formatter)
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+console.setFormatter(formatter)
+log.addHandler(console)
+log.addHandler(fh)
+
+log.info(args)
+
+model_name = args.bert_model
+dataset_name = args.bert_dataset
+only_predict = args.only_predict
+model_parameters = args.model_parameters
+pretrained_bert_parameters = args.pretrained_bert_parameters
+if pretrained_bert_parameters and model_parameters:
+    raise ValueError('Cannot provide both pre-trained BERT parameters and '
+                     'BertForQA model parameters.')
+lower = args.uncased
+
+epochs = args.epochs
+batch_size = args.batch_size
+test_batch_size = args.test_batch_size
+lr = args.lr
+ctx = mx.cpu() if args.gpu is None else mx.gpu(args.gpu)
+
+accumulate = args.accumulate
+log_interval = args.log_interval * accumulate if accumulate else args.log_interval
+if accumulate:
+    log.info('Using gradient accumulation. Effective batch size = {}'.
+             format(accumulate*batch_size))
+
+optimizer = args.optimizer
+warmup_ratio = args.warmup_ratio
+
+
+version_2 = args.version_2
+null_score_diff_threshold = args.null_score_diff_threshold
+
+max_seq_length = args.max_seq_length
+doc_stride = args.doc_stride
+max_query_length = args.max_query_length
+n_best_size = args.n_best_size
+max_answer_length = args.max_answer_length
+
+if max_seq_length <= max_query_length + 3:
+    raise ValueError('The max_seq_length (%d) must be greater than max_query_length '
+                     '(%d) + 3' % (max_seq_length, max_query_length))
+
+# vocabulary and tokenizer
+if args.sentencepiece:
+    logging.info('loading vocab file from sentence piece model: %s', args.sentencepiece)
+    if dataset_name:
+        warnings.warn('Both --dataset_name and --sentencepiece are provided. '
+                      'The vocabulary will be loaded based on --sentencepiece.')
+    vocab = nlp.vocab.BERTVocab.from_sentencepiece(args.sentencepiece)
+    dataset_name = None
+else:
+    vocab = None
+
+pretrained = not model_parameters and not pretrained_bert_parameters and not args.sentencepiece
+bert, vocab = nlp.model.get_model(
+    name=model_name,
+    dataset_name=dataset_name,
+    vocab=vocab,
+    pretrained=pretrained,
+    ctx=ctx,
+    use_pooler=False,
+    use_decoder=False
