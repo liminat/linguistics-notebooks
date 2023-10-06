@@ -277,4 +277,158 @@ bert, vocab = nlp.model.get_model(
     pretrained=pretrained,
     ctx=ctx,
     use_pooler=False,
-    use_decoder=False
+    use_decoder=False,
+    use_classifier=False)
+
+if args.sentencepiece:
+    tokenizer = nlp.data.BERTSPTokenizer(args.sentencepiece, vocab, lower=lower)
+else:
+    tokenizer = nlp.data.BERTTokenizer(vocab=vocab, lower=lower)
+
+batchify_fn = nlp.data.batchify.Tuple(
+    nlp.data.batchify.Stack(),
+    nlp.data.batchify.Pad(axis=0, pad_val=vocab[vocab.padding_token]),
+    nlp.data.batchify.Pad(axis=0, pad_val=vocab[vocab.padding_token]),
+    nlp.data.batchify.Stack('float32'),
+    nlp.data.batchify.Stack('float32'),
+    nlp.data.batchify.Stack('float32'))
+
+net = BertForQA(bert=bert)
+if model_parameters:
+    # load complete BertForQA parameters
+    net.load_parameters(model_parameters, ctx=ctx, cast_dtype=True)
+elif pretrained_bert_parameters:
+    # only load BertModel parameters
+    bert.load_parameters(pretrained_bert_parameters, ctx=ctx,
+                         ignore_extra=True, cast_dtype=True)
+    net.span_classifier.initialize(init=mx.init.Normal(0.02), ctx=ctx)
+elif pretrained:
+    # only load BertModel parameters
+    net.span_classifier.initialize(init=mx.init.Normal(0.02), ctx=ctx)
+else:
+    # no checkpoint is loaded
+    net.initialize(init=mx.init.Normal(0.02), ctx=ctx)
+
+net.hybridize(static_alloc=True)
+
+loss_function = BertForQALoss()
+loss_function.hybridize(static_alloc=True)
+
+
+def train():
+    """Training function."""
+    segment = 'train' if not args.debug else 'dev'
+    log.info('Loading %s data...', segment)
+    if version_2:
+        train_data = SQuAD(segment, version='2.0')
+    else:
+        train_data = SQuAD(segment, version='1.1')
+    if args.debug:
+        sampled_data = [train_data[i] for i in range(1000)]
+        train_data = mx.gluon.data.SimpleDataset(sampled_data)
+    log.info('Number of records in Train data:{}'.format(len(train_data)))
+
+    train_data_transform, _ = preprocess_dataset(
+        train_data, SQuADTransform(
+            copy.copy(tokenizer),
+            max_seq_length=max_seq_length,
+            doc_stride=doc_stride,
+            max_query_length=max_query_length,
+            is_pad=True,
+            is_training=True))
+    log.info('The number of examples after preprocessing:{}'.format(
+        len(train_data_transform)))
+
+    train_dataloader = mx.gluon.data.DataLoader(
+        train_data_transform, batchify_fn=batchify_fn,
+        batch_size=batch_size, num_workers=4, shuffle=True)
+
+    log.info('Start Training')
+
+    optimizer_params = {'learning_rate': lr}
+    try:
+        trainer = mx.gluon.Trainer(net.collect_params(), optimizer,
+                                   optimizer_params, update_on_kvstore=False)
+    except ValueError as e:
+        print(e)
+        warnings.warn('AdamW optimizer is not found. Please consider upgrading to '
+                      'mxnet>=1.5.0. Now the original Adam optimizer is used instead.')
+        trainer = mx.gluon.Trainer(net.collect_params(), 'adam',
+                                   optimizer_params, update_on_kvstore=False)
+
+    num_train_examples = len(train_data_transform)
+    step_size = batch_size * accumulate if accumulate else batch_size
+    num_train_steps = int(num_train_examples / step_size * epochs)
+    num_warmup_steps = int(num_train_steps * warmup_ratio)
+    step_num = 0
+
+    def set_new_lr(step_num, batch_id):
+        """set new learning rate"""
+        # set grad to zero for gradient accumulation
+        if accumulate:
+            if batch_id % accumulate == 0:
+                net.collect_params().zero_grad()
+                step_num += 1
+        else:
+            step_num += 1
+        # learning rate schedule
+        # Notice that this learning rate scheduler is adapted from traditional linear learning
+        # rate scheduler where step_num >= num_warmup_steps, new_lr = 1 - step_num/num_train_steps
+        if step_num < num_warmup_steps:
+            new_lr = lr * step_num / num_warmup_steps
+        else:
+            offset = (step_num - num_warmup_steps) * lr / \
+                (num_train_steps - num_warmup_steps)
+            new_lr = lr - offset
+        trainer.set_learning_rate(new_lr)
+        return step_num
+
+    # Do not apply weight decay on LayerNorm and bias terms
+    for _, v in net.collect_params('.*beta|.*gamma|.*bias').items():
+        v.wd_mult = 0.0
+    # Collect differentiable parameters
+    params = [p for p in net.collect_params().values()
+              if p.grad_req != 'null']
+    # Set grad_req if gradient accumulation is required
+    if accumulate:
+        for p in params:
+            p.grad_req = 'add'
+
+    epoch_tic = time.time()
+    total_num = 0
+    log_num = 0
+    for epoch_id in range(epochs):
+        step_loss = 0.0
+        tic = time.time()
+        for batch_id, data in enumerate(train_dataloader):
+            # set new lr
+            step_num = set_new_lr(step_num, batch_id)
+            # forward and backward
+            with mx.autograd.record():
+                _, inputs, token_types, valid_length, start_label, end_label = data
+
+                log_num += len(inputs)
+                total_num += len(inputs)
+
+                out = net(inputs.astype('float32').as_in_context(ctx),
+                          token_types.astype('float32').as_in_context(ctx),
+                          valid_length.astype('float32').as_in_context(ctx))
+
+                ls = loss_function(out, [
+                    start_label.astype('float32').as_in_context(ctx),
+                    end_label.astype('float32').as_in_context(ctx)]).mean()
+
+                if accumulate:
+                    ls = ls / accumulate
+            ls.backward()
+            # update
+            if not accumulate or (batch_id + 1) % accumulate == 0:
+                trainer.allreduce_grads()
+                nlp.utils.clip_grad_global_norm(params, 1)
+                trainer.update(1)
+
+            step_loss += ls.asscalar()
+
+            if (batch_id + 1) % log_interval == 0:
+                toc = time.time()
+                log.info('Epoch: {}, Batch: {}/{}, Loss={:.4f}, lr={:.7f} Time cost={:.1f} Th
