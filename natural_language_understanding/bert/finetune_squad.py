@@ -431,4 +431,118 @@ def train():
 
             if (batch_id + 1) % log_interval == 0:
                 toc = time.time()
-                log.info('Epoch: {}, Batch: {}/{}, Loss={:.4f}, lr={:.7f} Time cost={:.1f} Th
+                log.info('Epoch: {}, Batch: {}/{}, Loss={:.4f}, lr={:.7f} Time cost={:.1f} Thoughput={:.2f} samples/s'  # pylint: disable=line-too-long
+                         .format(epoch_id, batch_id, len(train_dataloader),
+                                 step_loss / log_interval,
+                                 trainer.learning_rate, toc - tic, log_num/(toc - tic)))
+                tic = time.time()
+                step_loss = 0.0
+                log_num = 0
+        epoch_toc = time.time()
+        log.info('Time cost={:.2f} s, Thoughput={:.2f} samples/s'.format(
+            epoch_toc - epoch_tic, total_num/(epoch_toc - epoch_tic)))
+
+    net.save_parameters(os.path.join(output_dir, 'net.params'))
+
+
+def evaluate():
+    """Evaluate the model on validation dataset.
+    """
+    log.info('Loading dev data...')
+    if version_2:
+        dev_data = SQuAD('dev', version='2.0')
+    else:
+        dev_data = SQuAD('dev', version='1.1')
+    if args.debug:
+        sampled_data = [dev_data[0], dev_data[1], dev_data[2]]
+        dev_data = mx.gluon.data.SimpleDataset(sampled_data)
+    log.info('Number of records in dev data:{}'.format(len(dev_data)))
+
+    dev_dataset = dev_data.transform(
+        SQuADTransform(
+            copy.copy(tokenizer),
+            max_seq_length=max_seq_length,
+            doc_stride=doc_stride,
+            max_query_length=max_query_length,
+            is_pad=False,
+            is_training=False)._transform, lazy=False)
+
+    dev_data_transform, _ = preprocess_dataset(
+        dev_data, SQuADTransform(
+            copy.copy(tokenizer),
+            max_seq_length=max_seq_length,
+            doc_stride=doc_stride,
+            max_query_length=max_query_length,
+            is_pad=False,
+            is_training=False))
+    log.info('The number of examples after preprocessing:{}'.format(
+        len(dev_data_transform)))
+
+    dev_dataloader = mx.gluon.data.DataLoader(
+        dev_data_transform,
+        batchify_fn=batchify_fn,
+        num_workers=4, batch_size=test_batch_size,
+        shuffle=False, last_batch='keep')
+
+    log.info('start prediction')
+
+    all_results = collections.defaultdict(list)
+
+    epoch_tic = time.time()
+    total_num = 0
+    for data in dev_dataloader:
+        example_ids, inputs, token_types, valid_length, _, _ = data
+        total_num += len(inputs)
+        out = net(inputs.astype('float32').as_in_context(ctx),
+                  token_types.astype('float32').as_in_context(ctx),
+                  valid_length.astype('float32').as_in_context(ctx))
+
+        output = mx.nd.split(out, axis=2, num_outputs=2)
+        example_ids = example_ids.asnumpy().tolist()
+        pred_start = output[0].reshape((0, -3)).asnumpy()
+        pred_end = output[1].reshape((0, -3)).asnumpy()
+
+        for example_id, start, end in zip(example_ids, pred_start, pred_end):
+            all_results[example_id].append(PredResult(start=start, end=end))
+
+    epoch_toc = time.time()
+    log.info('Time cost={:.2f} s, Thoughput={:.2f} samples/s'.format(
+        epoch_toc - epoch_tic, total_num/(epoch_toc - epoch_tic)))
+
+    log.info('Get prediction results...')
+
+    all_predictions = collections.OrderedDict()
+
+    for features in dev_dataset:
+        results = all_results[features[0].example_id]
+        example_qas_id = features[0].qas_id
+
+        prediction, _ = predict(
+            features=features,
+            results=results,
+            tokenizer=nlp.data.BERTBasicTokenizer(lower=lower),
+            max_answer_length=max_answer_length,
+            null_score_diff_threshold=null_score_diff_threshold,
+            n_best_size=n_best_size,
+            version_2=version_2)
+
+        all_predictions[example_qas_id] = prediction
+
+    with io.open(os.path.join(output_dir, 'predictions.json'),
+                 'w', encoding='utf-8') as fout:
+        data = json.dumps(all_predictions, ensure_ascii=False)
+        fout.write(data)
+
+    if version_2:
+        log.info('Please run evaluate-v2.0.py to get evaluation results for SQuAD 2.0')
+    else:
+        F1_EM = get_F1_EM(dev_data, all_predictions)
+        log.info(F1_EM)
+
+
+if __name__ == '__main__':
+    if not only_predict:
+        train()
+        evaluate()
+    elif model_parameters:
+        evaluate()
