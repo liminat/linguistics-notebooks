@@ -184,4 +184,71 @@ class FP16Trainer(object):
 
 class LossScaler(object):
     """Abstract loss scaler"""
-    de
+    def has_overflow(self, params):
+        """ detect inf and nan """
+        is_not_finite = 0
+        for param in params:
+            if param.grad_req != 'null':
+                grad = param.list_grad()[0]
+                is_not_finite += mx.nd.contrib.isnan(grad).sum()
+                is_not_finite += mx.nd.contrib.isinf(grad).sum()
+        # NDArray is implicitly converted to bool
+        if is_not_finite == 0:
+            return False
+        else:
+            return True
+
+    def update_scale(self, overflow):
+        raise NotImplementedError()
+
+class StaticLossScaler(LossScaler):
+    """Static loss scaler"""
+    def __init__(self, init_scale=1):
+        self.loss_scale = init_scale
+
+    def update_scale(self, overflow):
+        """update loss scale"""
+        pass
+
+class DynamicLossScaler(LossScaler):
+    """Class that manages dynamic loss scaling.
+
+    There are two problems regarding gradient scale when fp16 is used for training.
+    One is overflow: the fp16 gradient is too large that it causes NaN.
+    To combat such an issue, we need to scale down the gradient when such an event
+    is detected. The other is underflow: the gradient is too small such that the
+    precision suffers. This is hard to detect though. What dynamic loss scaler does
+    it that, it starts the scale at a relatively large value (e.g. 2**15).
+    Everytime when a NaN is detected in the gradient, the scale is reduced (by default)
+    by 2x. On the other hand, if a NaN is not detected for a long time
+    (e.g. 2000 steps), then the scale is increased (by default) by 2x."""
+    def __init__(self, init_scale=2.**15, scale_factor=2., scale_window=2000,
+                 tolerance=0.01):
+        self.loss_scale = init_scale
+        self.scale_factor = scale_factor
+        self.scale_window = scale_window
+        self.tolerance = tolerance
+        self._num_steps = 0
+        self._last_overflow_iter = -1
+        self._last_rescale_iter = -1
+        self._overflows_since_rescale = 0
+
+    def update_scale(self, overflow):
+        """dynamically update loss scale"""
+        iter_since_rescale = self._num_steps - self._last_rescale_iter
+        if overflow:
+            self._last_overflow_iter = self._num_steps
+            self._overflows_since_rescale += 1
+            percentage = self._overflows_since_rescale / float(iter_since_rescale)
+            # we tolerate a certrain amount of NaNs before actually scaling it down
+            if percentage >= self.tolerance:
+                self.loss_scale /= self.scale_factor
+                self._last_rescale_iter = self._num_steps
+                self._overflows_since_rescale = 0
+                if self.loss_scale < 1:
+                    warnings.warn('DynamicLossScaler: overflow detected. set loss_scale = %s'%
+                                  self.loss_scale)
+        elif (self._num_steps - self._last_overflow_iter) % self.scale_window == 0:
+            self.loss_scale *= self.scale_factor
+            self._last_rescale_iter = self._num_steps
+        self._num_steps += 1
