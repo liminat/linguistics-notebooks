@@ -168,4 +168,111 @@ def get_pretrain_data_text(data, batch_size, num_ctxes, shuffle, use_avg_len,
         The hard limit of the number of predictions for masked words
     whole_word_mask : bool
         Whether to use whole word masking.
-    n
+    num_parts : int
+        The number of partitions for the dataset.
+    part_idx : int
+        The index of the partition to read.
+    prefetch : bool
+        If set to True, a separate thread helps prefetching the next mini-batch of data.
+    num_workers : int
+        The number of worker processes for dataset contruction.
+    """
+    # handle commas in the provided path
+    num_files = sum([len(glob.glob(os.path.expanduser(d.strip()))) for d in data.split(',')])
+    logging.info('%d files found.', num_files)
+    assert num_files >= num_parts, \
+        'Number of training files must be greater than the number of partitions. ' \
+        'Only found %d files at %s'%(num_files, data)
+    worker_pool = multiprocessing.Pool(num_workers)
+    dataset_cls = functools.partial(BERTPretrainDataset, tokenizer=tokenizer,
+                                    max_seq_length=max_seq_length,
+                                    short_seq_prob=short_seq_prob,
+                                    masked_lm_prob=masked_lm_prob,
+                                    max_predictions_per_seq=max_predictions_per_seq,
+                                    whole_word_mask=whole_word_mask,
+                                    vocab=vocab, num_workers=num_workers, worker_pool=worker_pool)
+
+    split_sampler = nlp.data.SplitSampler(num_files, num_parts=num_parts, part_index=part_idx)
+    stream = nlp.data.SimpleDatasetStream(dataset_cls, data, split_sampler)
+    if prefetch:
+        stream = nlp.data.PrefetchingStream(stream)
+    # create data loader based on the dataset
+    dataloader_xform = BERTLoaderTransform(use_avg_len, batch_size,
+                                           shuffle, num_ctxes, num_buckets)
+    stream = stream.transform(dataloader_xform)
+    return stream
+
+class BERTLoaderTransform(object):
+    """Create dataloader for a BERT dataset. """
+
+    def __init__(self, use_avg_len, batch_size, shuffle, num_ctxes, num_buckets):
+        self._use_avg_len = use_avg_len
+        self._batch_size = batch_size
+        self._shuffle = shuffle
+        self._num_ctxes = num_ctxes
+        self._num_buckets = num_buckets
+
+    def __call__(self, dataset):
+        """create data loader based on the dataset chunk"""
+        if isinstance(dataset, nlp.data.NumpyDataset):
+            lengths = dataset.get_field('valid_lengths')
+        elif isinstance(dataset, BERTPretrainDataset):
+            lengths = dataset.transform(lambda input_ids, segment_ids, masked_lm_positions, \
+                                               masked_lm_ids, masked_lm_weights, \
+                                               next_sentence_labels, valid_lengths: \
+                                               valid_lengths, lazy=False)
+        else:
+            raise ValueError('unexpected dataset type: %s'%str(dataset))
+
+        # A batch includes: input_id, masked_id, masked_position, masked_weight,
+        #                   next_sentence_label, segment_id, valid_length
+        batchify_fn = Tuple(Pad(), Pad(), Pad(), Pad(), Stack(), Pad(), Stack())
+        if self._use_avg_len:
+            # sharded data loader
+            sampler = nlp.data.FixedBucketSampler(lengths=lengths,
+                                                  # batch_size per shard
+                                                  batch_size=self._batch_size,
+                                                  num_buckets=self._num_buckets,
+                                                  shuffle=self._shuffle,
+                                                  use_average_length=True,
+                                                  num_shards=self._num_ctxes)
+            dataloader = nlp.data.ShardedDataLoader(dataset,
+                                                    batch_sampler=sampler,
+                                                    batchify_fn=batchify_fn,
+                                                    num_workers=self._num_ctxes)
+        else:
+            sampler = nlp.data.FixedBucketSampler(lengths,
+                                                  batch_size=self._batch_size * self._num_ctxes,
+                                                  num_buckets=self._num_buckets,
+                                                  ratio=0,
+                                                  shuffle=self._shuffle)
+            dataloader = DataLoader(dataset=dataset,
+                                    batch_sampler=sampler,
+                                    batchify_fn=batchify_fn,
+                                    num_workers=1)
+        logging.debug('Sampler created for a new dataset:\n%s', sampler.stats())
+        return dataloader
+
+def get_pretrain_data_npz(data, batch_size, num_ctxes, shuffle, use_avg_len,
+                          num_buckets, num_parts=1, part_idx=0, prefetch=True):
+    """create dataset for pretraining based on pre-processed npz files."""
+    # handle commas in the provided path
+    num_files = sum([len(glob.glob(os.path.expanduser(d.strip()))) for d in data.split(',')])
+    logging.info('%d files found.', num_files)
+    assert num_files >= num_parts, \
+        'Number of training files must be greater than the number of partitions. ' \
+        'Only found %d files at %s'%(num_files, data)
+    split_sampler = nlp.data.SplitSampler(num_files, num_parts=num_parts, part_index=part_idx)
+    stream = nlp.data.SimpleDatasetStream(nlp.data.NumpyDataset, data, split_sampler)
+    if prefetch:
+        stream = nlp.data.PrefetchingStream(stream)
+
+    # create data loader based on the dataset
+    dataloader_xform = BERTLoaderTransform(use_avg_len, batch_size,
+                                           shuffle, num_ctxes, num_buckets)
+    stream = stream.transform(dataloader_xform)
+    return stream
+
+def get_dummy_dataloader(dataloader, target_shape):
+    """Return a dummy data loader which returns a fixed data batch of target shape"""
+    data_iter = enumerate(data
