@@ -407,4 +407,75 @@ def evaluate(data_eval, model, nsp_loss, mlm_loss, vocab_size, ctx, log_interval
         total_nsp_loss += running_nsp_loss
     total_mlm_loss /= step_num
     total_nsp_loss /= step_num
-    logging.info('Eval mlm_loss={:
+    logging.info('Eval mlm_loss={:.3f}\tmlm_acc={:.1f}\tnsp_loss={:.3f}\tnsp_acc={:.1f}\t'
+                 .format(total_mlm_loss.asscalar(), mlm_metric.get_global()[1] * 100,
+                         total_nsp_loss.asscalar(), nsp_metric.get_global()[1] * 100))
+    logging.info('Eval cost={:.1f}s'.format(eval_end_time - eval_begin_time))
+
+def get_argparser():
+    """Argument parser"""
+    parser = argparse.ArgumentParser(description='BERT pretraining example.')
+    parser.add_argument('--num_steps', type=int, default=20, help='Number of optimization steps')
+    parser.add_argument('--num_buckets', type=int, default=10,
+                        help='Number of buckets for variable length sequence sampling')
+    parser.add_argument('--dtype', type=str, default='float16', help='data dtype')
+    parser.add_argument('--batch_size', type=int, default=8, help='Batch size per GPU.')
+    parser.add_argument('--accumulate', type=int, default=1,
+                        help='Number of batches for gradient accumulation. '
+                             'The effective batch size = batch_size * accumulate.')
+    parser.add_argument('--use_avg_len', action='store_true',
+                        help='Use average length information for the bucket sampler. '
+                             'The batch size is approximately the number of tokens in the batch')
+    parser.add_argument('--batch_size_eval', type=int, default=8,
+                        help='Batch size per GPU for evaluation.')
+    parser.add_argument('--dataset_name', type=str, default='book_corpus_wiki_en_uncased',
+                        choices=['book_corpus_wiki_en_uncased', 'book_corpus_wiki_en_cased',
+                                 'wiki_multilingual_uncased', 'wiki_multilingual_cased',
+                                 'wiki_cn_cased'],
+                        help='The pre-defined dataset from which the vocabulary is created. '
+                             'Default is book_corpus_wiki_en_uncased.')
+    parser.add_argument('--pretrained', action='store_true',
+                        help='Load the pretrained model released by Google.')
+    parser.add_argument('--model', type=str, default='bert_12_768_12',
+                        help='Model to run pre-training on. '
+                             'Options are bert_12_768_12, bert_24_1024_16')
+    parser.add_argument('--data', type=str, default=None,
+                        help='Path to training data. Training is skipped if not set.')
+    parser.add_argument('--data_eval', type=str, required=True,
+                        help='Path to evaluation data. Evaluation is skipped if not set.')
+    parser.add_argument('--ckpt_dir', type=str, default='./ckpt_dir',
+                        help='Path to checkpoint directory')
+    parser.add_argument('--start_step', type=int, default=0,
+                        help='Start optimization step from the checkpoint.')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--warmup_ratio', type=float, default=0.01,
+                        help='ratio of warmup steps used in NOAM\'s stepsize schedule')
+    parser.add_argument('--log_interval', type=int, default=250, help='Report interval')
+    parser.add_argument('--ckpt_interval', type=int, default=25000, help='Checkpoint interval')
+    parser.add_argument('--dummy_data_len', type=int, default=None,
+                        help='If provided, a data batch of target sequence length is '
+                             'used. For benchmarking purpuse only.')
+    parser.add_argument('--verbose', action='store_true', help='verbose logging')
+    parser.add_argument('--profile', type=str, default=None,
+                        help='output profiling result to the target file')
+    return parser
+
+def generate_dev_set(tokenizer, vocab, cache_file, args):
+    """Generate validation set."""
+    # set random seed to generate dev data deterministically
+    np.random.seed(0)
+    random.seed(0)
+    mx.random.seed(0)
+
+    worker_pool = multiprocessing.Pool()
+    eval_files = glob.glob(os.path.expanduser(args.data_eval))
+    num_files = len(eval_files)
+    assert num_files > 0, 'Number of eval files must be greater than 0.' \
+                          'Only found %d files at %s'%(num_files, args.data_eval)
+    logging.info('Generating validation set from %d files on rank 0.', len(eval_files))
+    create_training_instances((eval_files, tokenizer, args.max_seq_length,
+                               args.short_seq_prob, args.masked_lm_prob,
+                               args.max_predictions_per_seq, vocab,
+                               1, args.num_data_workers,
+                               worker_pool, cache_file))
+    logging.info('Done generating validation set on rank 0.')
