@@ -152,4 +152,37 @@ def generate():
     bos_tokens = tokenizer(bos_str)
     bos_ids = vocab[bos_tokens]
     eos_id = vocab[vocab.eos_token]
-    if args.command == 'ran
+    if args.command == 'random-sample':
+        print('Sampling Parameters: beam_size={}, temperature={}, use_top_k={}'\
+                .format(args.beam_size, args.temperature, args.use_top_k))
+        sampler = nlp.model.SequenceSampler(beam_size=args.beam_size,
+                                            decoder=decoder,
+                                            eos_id=eos_id,
+                                            max_length=args.max_length - len(bos_tokens),
+                                            temperature=args.temperature,
+                                            top_k=args.use_top_k)
+    else:
+        print('Beam Seach Parameters: beam_size={}, alpha={}, K={}'\
+                .format(args.beam_size, args.alpha, args.k))
+        scorer = nlp.model.BeamSearchScorer(alpha=args.alpha, K=args.k, from_logits=False)
+        sampler = nlp.model.BeamSearchSampler(beam_size=args.beam_size,
+                                              decoder=decoder,
+                                              eos_id=eos_id,
+                                              scorer=scorer,
+                                              max_length=args.max_length - len(bos_tokens))
+    inputs, begin_states = get_initial_input_state(decoder, bos_ids)
+    # samples have shape (1, beam_size, length), scores have shape (1, beam_size)
+    samples, scores, valid_lengths = sampler(inputs, begin_states)
+    samples = samples[0].asnumpy()
+    scores = scores[0].asnumpy()
+    valid_lengths = valid_lengths[0].asnumpy()
+
+    print('Generation Result:')
+    for i in range(args.print_num):
+        generated_tokens = [vocab.idx_to_token[ele] for ele in samples[i][:valid_lengths[i]]]
+        tokens = bos_tokens + generated_tokens[1:]
+        print([detokenizer(tokens).strip(), scores[i]])
+
+
+if __name__ == '__main__':
+    generate()
